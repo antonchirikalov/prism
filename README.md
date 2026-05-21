@@ -265,6 +265,42 @@ Generates publication-quality PNG diagrams using PaperBanana (Retriever → Plan
 
 ---
 
+## Optional Standalone Agents
+
+These agents are **not part of any pipeline** — invoke them directly after a pipeline run when needed.
+
+### `confluence_publisher`
+Publishes a finalized Markdown document to Confluence with embedded illustrations. Handles Markdown → Confluence XHTML conversion, page creation, and PNG attachment upload via REST API.
+
+**Auth:** Personal Access Token (Bearer). Env vars: `CONFLUENCE_URL`, `CONFLUENCE_PERSONAL_TOKEN`.
+
+```bash
+export CONFLUENCE_URL="https://your-confluence.example.com"
+export CONFLUENCE_PERSONAL_TOKEN="<your-PAT>"
+
+.venv/bin/python .github/skills/confluence-publisher/scripts/publish_to_confluence.py \
+  --draft path/to/_requirements.md \
+  --illustrations path/to/illustrations/ \
+  --parent-id <parent-page-id> \
+  --space <SPACE_KEY>
+```
+
+**Tools:** `read`, `terminal`, `search`
+
+> Note: image upload uses direct REST API calls, not MCP Confluence tools — MCP does not support attachment upload.
+
+### `word_form_builder`
+Reads `_requirements.md` and source extracts, enriches answer options via Tavily search, and generates an interactive Word `.docx` clarification form for the client — native SDT checkboxes, dropdowns, and pre-filled tables. No macros, no document protection required.
+
+Typically invoked after the **extract** pipeline, before a client workshop.
+
+**Input:** `_requirements.md` + extracts directory  
+**Output:** `clarification_form_r<N>.docx`
+
+**Tools:** `read`, `write`, `bash`, `mcp_tavily-remote_tavily_search`
+
+---
+
 ## Interactive Mode (HITL)
 
 Run via the `@orchestrator` agent in VS Code chat:
@@ -345,6 +381,8 @@ rfp-manager/
       requirements_critic.agent.md
       orchestrator.agent.md
       illustrator.agent.md
+      confluence-publisher.agent.md   ← optional, standalone
+      word_form_builder.agent.md      ← optional, standalone
     instructions/
       illustrator/
         generation-pipeline.instructions.md
