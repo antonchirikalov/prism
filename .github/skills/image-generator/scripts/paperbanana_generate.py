@@ -2,16 +2,16 @@
 """Wrapper around the real PaperBanana package (llmsresearch/paperbanana).
 
 Uses the PaperBanana multi-agent pipeline with OpenAI as the provider:
+  Phase 0 (Optimization): Context Enricher + Caption Sharpener
   Phase 1 (Linear Planning): Retriever → Planner → Stylist
   Phase 2 (Iterative Refinement): Visualizer ↔ Critic
 
 Requires:
-  pip install "paperbanana[openai]"   (or install from git for latest)
+  pip install "git+https://github.com/llmsresearch/paperbanana[openai]"
   OPENAI_API_KEY in .env
 
 Usage:
   python paperbanana_generate.py "description" "output.png" --context "methodology text"
-  python paperbanana_generate.py "description" "output.png" --direct
 """
 
 import argparse
@@ -32,25 +32,26 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _WORKSPACE_ROOT = _SCRIPT_DIR.parents[3]  # scripts → image-generator → skills → .github → repo root
 _ENV_FILE = _WORKSPACE_ROOT / ".env"
 
+# Environment variable priority: .env file takes precedence over existing env vars (override=True)
 if _ENV_FILE.exists():
-    load_dotenv(_ENV_FILE)
+    load_dotenv(_ENV_FILE, override=True)
     logger.info("Loaded .env from %s", _ENV_FILE)
 else:
     # Fallback: let find_dotenv search from CWD upward
-    load_dotenv()
+    load_dotenv(override=True)
     logger.warning("No .env at %s — falling back to find_dotenv()", _ENV_FILE)
 
 
-def _build_settings(iterations: int = 3) -> "Settings":
+def _build_settings(iterations: int = 3, optimize: bool = True, auto_refine: bool = False) -> "Settings":
     """Build PaperBanana Settings configured for OpenAI provider.
 
-    Package defaults: gpt-5.2 (VLM), gpt-image-1.5 (image gen).
+    Package defaults: gpt-5.2 (VLM), gpt-image-2 (image gen).
     Override via TEXT_MODEL / IMAGE_MODEL env vars if needed.
     """
     from paperbanana.core.config import Settings
 
     vlm_model = os.environ.get("TEXT_MODEL", "gpt-5.2")
-    image_model = os.environ.get("IMAGE_MODEL", "gpt-image-1.5")
+    image_model = os.environ.get("IMAGE_MODEL", "gpt-image-2")
 
     kwargs: dict = {
         "vlm_provider": "openai",
@@ -60,8 +61,8 @@ def _build_settings(iterations: int = 3) -> "Settings":
         "openai_vlm_model": vlm_model,
         "openai_image_model": image_model,
         "refinement_iterations": iterations,
-        "auto_refine": False,
-        "optimize_inputs": False,
+        "auto_refine": auto_refine,
+        "optimize_inputs": optimize,
         "output_format": "png",
         "save_iterations": True,
     }
@@ -73,7 +74,9 @@ async def run_pipeline(
     description: str,
     output_path: str,
     context: str = "",
-    max_critic_rounds: int = 2,
+    max_critic_rounds: int = 3,
+    optimize: bool = True,
+    auto_refine: bool = False,
 ) -> str:
     """Run the full PaperBanana pipeline via the real package.
 
@@ -81,7 +84,7 @@ async def run_pipeline(
     """
     from paperbanana import PaperBananaPipeline, GenerationInput, DiagramType
 
-    settings = _build_settings(iterations=max_critic_rounds)
+    settings = _build_settings(iterations=max_critic_rounds, optimize=optimize, auto_refine=auto_refine)
     pipeline = PaperBananaPipeline(settings=settings)
 
     gen_input = GenerationInput(
@@ -90,7 +93,7 @@ async def run_pipeline(
         diagram_type=DiagramType.METHODOLOGY,
     )
 
-    logger.info("Starting pipeline (provider=openai, iterations=%d)…", max_critic_rounds)
+    logger.info("Starting pipeline (provider=openai, iterations=%d, optimize=%s, auto_refine=%s)…", max_critic_rounds, optimize, auto_refine)
     result = await pipeline.generate(gen_input)
 
     # Copy the final image to the requested output path
@@ -98,43 +101,6 @@ async def run_pipeline(
     shutil.copy2(result.image_path, output_path)
 
     logger.info("Pipeline complete: %d iteration(s), saved to %s", len(result.iterations), output_path)
-    return output_path
-
-
-def run_direct(description: str, output_path: str, size: str = "") -> str:
-    """Direct OpenAI generation — single API call, simpler output."""
-    import base64
-    import openai
-
-    client = openai.OpenAI()
-    model = os.environ.get("IMAGE_MODEL", "gpt-image-1.5")
-    size = size or os.environ.get("IMAGE_SIZE", "1536x1024")
-
-    prompt = (
-        "Create a professional, publication-quality technical diagram in clean vector infographic style. "
-        "Use soft pastel color fills for blocks, thin gray borders, rounded rectangles, clean sans-serif labels, "
-        "directional arrows with arrowheads, and generous whitespace on a pure white background. "
-        "No monospaced fonts, no ASCII art, no terminal-style rendering. "
-        "The diagram should look like a polished Figma/Lucidchart export.\n\n"
-        f"{description}"
-    )
-    logger.info("Generating image via OpenAI direct mode (model=%s, size=%s)…", model, size)
-
-    response = client.images.generate(
-        model=model,
-        prompt=prompt,
-        n=1,
-        size=size,
-        quality="high",
-        background="opaque",
-        output_format="png",
-    )
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    image_data = base64.b64decode(response.data[0].b64_json)
-    with open(output_path, "wb") as f:
-        f.write(image_data)
-
-    logger.info("Saved to %s", output_path)
     return output_path
 
 
@@ -157,13 +123,18 @@ def main():
         help="Visualizer-Critic refinement iterations (default: MAX_CRITIC_ROUNDS env or 2)"
     )
     parser.add_argument(
-        "--direct", action="store_true",
-        help="Skip PaperBanana pipeline, use direct OpenAI image generation"
+        "--no-optimize", dest="optimize", action="store_false",
+        help="Disable Phase 0 optimization (Context Enricher + Caption Sharpener). Enabled by default."
     )
     parser.add_argument(
-        "--size", default="",
-        help="Image size (e.g., 1536x1024, 1024x1024). Default from IMAGE_SIZE env or 1536x1024"
+        "--auto", action="store_true",
+        help="Auto-refine until critic is satisfied (uses --max-iterations as cap, default 5)"
     )
+    parser.add_argument(
+        "--max-iterations", type=int, default=5,
+        help="Max refinement iterations when --auto is used (default: 5)"
+    )
+    parser.set_defaults(optimize=True)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -180,17 +151,17 @@ def main():
         )
         sys.exit(1)
 
-    max_rounds = args.critic_rounds or int(os.environ.get("MAX_CRITIC_ROUNDS", "2"))
+    max_rounds = args.critic_rounds or int(os.environ.get("MAX_CRITIC_ROUNDS", "3"))
+    iterations = args.max_iterations if args.auto else max_rounds
 
-    if args.direct:
-        run_direct(args.description, args.output, size=args.size)
-    else:
-        asyncio.run(run_pipeline(
-            description=args.description,
-            output_path=args.output,
-            context=args.context,
-            max_critic_rounds=max_rounds,
-        ))
+    asyncio.run(run_pipeline(
+        description=args.description,
+        output_path=args.output,
+        context=args.context,
+        max_critic_rounds=iterations,
+        optimize=args.optimize,
+        auto_refine=args.auto,
+    ))
 
 
 if __name__ == "__main__":

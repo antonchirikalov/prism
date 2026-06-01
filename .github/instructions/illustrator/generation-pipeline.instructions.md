@@ -15,9 +15,23 @@ Phase 2: Generate (PaperBanana package: Retriever → Planner → Stylist → Vi
 
 The `paperbanana` package handles prompt engineering, reference retrieval, aesthetic refinement, image generation, and iterative critique internally. The Illustrator's job is to **extract the right description and context** from the draft and feed them to the script.
 
+## Prerequisites
+
+All commands use `.venv/bin/python3` — relative to the workspace root (default CWD for `run_in_terminal`).
+
+**Before generating, verify the venv exists:**
+```bash
+ls .venv/bin/python3
+```
+
+**If missing — create it:**
+```bash
+python3 -m venv .venv && .venv/bin/pip install "git+https://github.com/llmsresearch/paperbanana[openai]"
+```
+
 ## Phase 1: Plan
 
-1. Read the final draft (`generated_docs_[TIMESTAMP]/draft/v1.md`) and `research/_plan/params.md`
+1. Read the target document (`DOCUMENT_PATH` — provided by the caller in the prompt). If `{BASE_FOLDER}/research/_plan/params.md` exists, read it too.
 2. **Extract all `<!-- ILLUSTRATION: type=..., section=..., description="..." -->` placeholders** left by the Writer. Each placeholder has a caption line below it: `*Рис. N. Caption*`
 3. For each placeholder, parse:
    - `type` — architecture, comparison, pipeline, infographic, conceptual
@@ -33,7 +47,7 @@ The `paperbanana` package handles prompt engineering, reference retrieval, aesth
    - **Context** (200-500 words): copy the relevant section text from the draft for the Planner agent to understand the domain.
    - Do NOT micro-manage layout, colors, composition, or background — PaperBanana's Planner/Stylist/Critic agents handle all styling decisions internally.
 6. Record the plan internally before proceeding to generation.
-7. Determine illustration label from params.md `language`: Russian → "Рис.", English → "Fig."
+7. Determine illustration label: read `language` from `params.md` if available; otherwise use the language specified in the calling prompt; default is Russian ("Рис.", "Fig." for English).
 
 ## Phase 2: Generate
 
@@ -43,8 +57,8 @@ For each illustration, select the mode based on type:
 
 | Mode | When to use | Command |
 |---|---|---|
-| **pipeline** (default) | All illustrations | `python3 ... "[description]" "path.png" --context "[section text]" --critic-rounds 2` |
-| **`--direct`** | When `--direct` flag is explicitly requested | `python3 ... "[SHORT prompt]" "path.png" --direct` |
+| **pipeline** (default) | All illustrations | `.venv/bin/python3 ... "[description]" "path.png" --context "[section text]" --critic-rounds 3` |
+| **`--auto`** | When quality matters more than speed | `.venv/bin/python3 ... "[description]" "path.png" --context "[section text]" --auto --max-iterations 5` |
 
 > **Pipeline takes 3–5 min per illustration (5–7 API calls).** Always use `run_in_terminal` with `timeout: 0` (no timeout limit).
 
@@ -54,13 +68,11 @@ For each illustration, select the mode based on type:
 
 Provide a clear description (2-6 sentences) and pass 200-500 words of section context via `--context`. The Planner/Stylist/Critic cycle handles layout, colors, and refinement automatically. Do NOT add styling instructions — PaperBanana does this internally.
 
-**For `--direct` mode (when set in params.md or explicitly requested):**
-
-Keep prompts **SHORT** — 2-4 sentences, max ~100 words. The script auto-prepends vector-style instructions. See [style-guidelines](style-guidelines.instructions.md) for examples.
-
 ### Step 3: Generate
 
-Run one command per illustration. After all are generated:
+**Launch ALL illustration commands in parallel** — use `run_in_terminal` with `mode: async` for every command, starting all of them before waiting for any to finish. Collect all terminal IDs, then check results once all are done. **Never wait for one illustration to complete before starting the next.**
+
+After all are generated:
 
 1. **EMBED ILLUSTRATIONS IN THE DOCUMENT** — this step is MANDATORY:
 
@@ -70,21 +82,21 @@ Run one command per illustration. After all are generated:
 
    *Рис. 1. Caption text*
    ```
-   Use "Рис." for Russian, "Fig." for English (from params.md language).
+   Use "Рис." for Russian, "Fig." for English (from params.md if present, else from calling prompt, default Russian).
 
    **Path A — Placeholders exist:**
    Replace each `<!-- ILLUSTRATION: ... -->` placeholder in the draft with the image link line. The Writer already placed a `*Рис. N. Caption*` caption below the placeholder — **keep it**, only replace the HTML comment.
 
    **Path B — No placeholders (fallback):**
    You MUST STILL embed illustrations. For each generated PNG:
-   - Find the target section heading (H2 `##`) in `draft/v1.md`
+   - Find the target section heading (H2 `##`) in `DOCUMENT_PATH`
    - Locate the end of the first paragraph after that heading
    - Insert both the image link AND the italic caption line
 
 2. Create `illustrations/_manifest.md` — must include **Regeneration Prompts** section (see below).
-3. **VERIFY:** Read v1.md and confirm every generated PNG is referenced. If any is missing, insert it.
+3. **VERIFY:** Read `DOCUMENT_PATH` and confirm every generated PNG is referenced. If any is missing, insert it.
 
-**Output without embedded images = FAILED. Every PNG must appear as `![...]` in v1.md.**
+**Output without embedded images = FAILED. Every PNG must appear as `![...]` in `DOCUMENT_PATH`.**
 
 ## Manifest Format (with Regeneration Prompts)
 
@@ -130,7 +142,7 @@ The exact context string passed via --context
   "description..." \
   "illustrations/diagram_N.png" \
   --context "context..." \
-  --critic-rounds 2
+  --critic-rounds 3
 \`\`\`
 ```
 

@@ -7,6 +7,13 @@ description: Prompt guidelines for the Illustrator agent — how to write descri
 
 PaperBanana handles all styling internally (colors, layout, shapes, typography) via its Planner → Stylist → Visualizer ↔ Critic pipeline. The Illustrator agent only needs to provide a good **description** and **context**.
 
+## Fill Rule
+
+**The diagram must fill the full image canvas.** No large empty margins, padding, or whitespace around the illustration — every part of the image area should be used. Add this requirement explicitly in every description prompt:
+> "... Fill the entire canvas. No empty margins or padding around the diagram."
+
+A centered diagram floating in a sea of white is unacceptable.
+
 ## Background Rule
 
 **All illustrations MUST use a pure white (#FFFFFF) background.** Add this requirement explicitly at the start of every description prompt:

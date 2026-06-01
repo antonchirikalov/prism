@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import os
 from loguru import logger
 import re
 import subprocess
@@ -25,7 +26,7 @@ from pathlib import Path
 # ── Constants ─────────────────────────────────────────────────────────────────
 VERSION = "0.1.0"
 REPO_ROOT = Path(__file__).resolve().parent
-AGENT_TIMEOUT_S = 1200  # 20 min — large PDFs can take 8-10 min per agent
+AGENT_TIMEOUT_S = 3600  # 60 min — large PDFs can take 8-10 min per agent
 MAX_CRITIC_ROUNDS = 5  # safety cap — critic loops until APPROVED or this limit
 SUPPORTED_EXT = {".md", ".txt", ".docx", ".xlsx", ".pptx",
                  ".pdf", ".png", ".jpg", ".jpeg", ".webp"}
@@ -33,6 +34,156 @@ EXCLUDED_DIRS = {"plan", ".git"}
 CONFLUENCE_DOMAINS: set[str] = {"confluence.scnsoft.com"}
 
 logger.remove()  # configured in main() once args are parsed
+
+MIN_OUTPUT_BYTES = 200  # gate threshold for written files
+
+# ── Gate functions ────────────────────────────────────────────────────────────
+
+def gate_extract_file(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, f"missing: {path.name}"
+    if path.stat().st_size < 50:
+        return False, f"too small: {path.stat().st_size} bytes"
+    return True, ""
+
+
+def gate_requirements_file(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, f"missing: {path.name}"
+    if path.stat().st_size < MIN_OUTPUT_BYTES:
+        return False, f"too small: {path.stat().st_size} bytes"
+    return True, ""
+
+
+def gate_verdict_file(path: Path) -> tuple[bool, str]:
+    if not path.exists():
+        return False, f"missing: {path.name}"
+    try:
+        first_line = path.read_text(encoding="utf-8").strip().splitlines()[0]
+    except Exception:
+        return False, "unreadable"
+    if not re.match(r"VERDICT:\s*(APPROVED|REVISE)", first_line):
+        return False, f"first line not VERDICT: {first_line[:60]!r}"
+    return True, ""
+
+
+# ── Ledger: crash-safe checkpoint ────────────────────────────────────────────
+
+class Ledger:
+    """Thread-safe run-state ledger stored as state.json in the output directory."""
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._state: dict = {}
+        self._lock = threading.Lock()
+
+    def _now(self) -> str:
+        from datetime import timezone as _tz
+        return datetime.now(_tz.utc).isoformat()
+
+    def _save(self):
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._state, ensure_ascii=False, indent=2))
+        os.replace(tmp, self._path)
+
+    @classmethod
+    def create(cls, path: Path, run_id: str, project_dir: Path,
+               output_dir: Path) -> "Ledger":
+        led = cls(path)
+        led._state = {
+            "schema_version": cls.SCHEMA_VERSION,
+            "run_id": run_id,
+            "project_dir": str(project_dir),
+            "output_dir": str(output_dir),
+            "created_at": led._now(),
+            "critic_round": 0,
+            "critic_complete": False,
+            "last_verdict": None,
+            "steps": {},
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        led._save()
+        return led
+
+    @classmethod
+    def load(cls, path: Path) -> "Ledger":
+        led = cls(path)
+        led._state = json.loads(path.read_text())
+        # Reset running → pending (crash recovery)
+        for step in led._state.get("steps", {}).values():
+            if step.get("state") == "running":
+                step["state"] = "pending"
+        led._save()
+        return led
+
+    @property
+    def run_id(self) -> str:
+        return self._state["run_id"]
+
+    @property
+    def project_dir(self) -> Path:
+        return Path(self._state["project_dir"])
+
+    @property
+    def output_dir(self) -> Path:
+        return Path(self._state["output_dir"])
+
+    def get_critic_round(self) -> int:
+        return self._state.get("critic_round", 0)
+
+    def is_critic_complete(self) -> bool:
+        return self._state.get("critic_complete", False)
+
+    def update_critic_loop(self, round_num: int, last_verdict: str) -> None:
+        with self._lock:
+            self._state["critic_round"] = round_num
+            self._state["last_verdict"] = last_verdict
+            self._save()
+
+    def set_critic_complete(self, last_verdict: str) -> None:
+        with self._lock:
+            self._state["critic_complete"] = True
+            self._state["last_verdict"] = last_verdict
+            self._save()
+
+    def is_done(self, step_id: str, artifact_path: Path, gate_fn) -> bool:
+        with self._lock:
+            step = self._state.get("steps", {}).get(step_id, {})
+            if step.get("state") != "done":
+                return False
+        ok, _ = gate_fn(artifact_path)
+        return ok
+
+    def mark_running(self, step_id: str) -> None:
+        with self._lock:
+            self._state.setdefault("steps", {})[step_id] = {
+                "state": "running",
+                "started_at": self._now(),
+            }
+            self._save()
+
+    def mark_done(self, step_id: str, artifact_path: Path, wall_s: float) -> None:
+        with self._lock:
+            self._state.setdefault("steps", {})[step_id] = {
+                "state": "done",
+                "artifact": str(artifact_path),
+                "wall_s": round(wall_s, 1),
+                "done_at": self._now(),
+            }
+            self._save()
+
+    def mark_failed(self, step_id: str, error: str, wall_s: float) -> None:
+        with self._lock:
+            self._state.setdefault("steps", {})[step_id] = {
+                "state": "failed",
+                "error": error,
+                "wall_s": round(wall_s, 1),
+                "failed_at": self._now(),
+            }
+            self._save()
+
 
 DEFAULT_PARAMS_YAML = """\
 industry: unknown
@@ -512,7 +663,7 @@ def save_extract(result: AgentResult, artifacts_dir: Path):
             json.dumps(result.parsed_json, ensure_ascii=False, indent=2)
         )
     else:
-        (extract_dir / "extract.json").write_text(
+        (extract_dir / "extract.error.json").write_text(
             json.dumps({
                 "error": result.error,
                 "source_file": result.slug,
@@ -615,7 +766,7 @@ def run_agent_write_mode(agent_name: str, prompt_file: Path, slug: str,
 
 
 def run_phase2(results: list, artifacts_dir: Path, project_dir: Path,
-               params: dict, output_dir: Path = None) -> bool:
+               params: dict, output_dir: Path = None, ledger=None) -> bool:
     """Run requirements_writer agent; agent writes _requirements.md directly."""
     successful = [r for r in results if r.success]
     if not successful:
@@ -623,19 +774,27 @@ def run_phase2(results: list, artifacts_dir: Path, project_dir: Path,
         print("[PHASE:2] Skipped — no successful extracts from Phase 1")
         return False
 
-    print(f"[PHASE:2] Synthesising {len(successful)} extract(s) into _requirements.md ...")
-
-    extracts_dir = artifacts_dir / "extracts"
-    prompts_dir = artifacts_dir / "prompts"
-    prompts_dir.mkdir(parents=True, exist_ok=True)
     if output_dir is None:
         output_dir = project_dir.parent
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "_requirements.md"
 
+    if ledger and ledger.is_done("phase2:requirements_writer", output_path, gate_requirements_file):
+        print("[PHASE:2] Skipping — already done")
+        return True
+
+    print(f"[PHASE:2] Synthesising {len(successful)} extract(s) into _requirements.md ...")
+
+    extracts_dir = artifacts_dir / "extracts"
+    prompts_dir = artifacts_dir / "prompts"
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+
     prompt_content = render_phase2_prompt(extracts_dir, results, project_dir, output_path)
     prompt_file = prompts_dir / "_requirements_writer.md"
     prompt_file.write_text(prompt_content, encoding="utf-8")
+
+    if ledger:
+        ledger.mark_running("phase2:requirements_writer")
 
     ok, jsonl_log = run_agent_write_mode(
         "requirements_writer",
@@ -654,11 +813,15 @@ def run_phase2(results: list, artifacts_dir: Path, project_dir: Path,
 
     if not ok:
         print("[PHASE:2] FAILED — agent process error")
+        if ledger:
+            ledger.mark_failed("phase2:requirements_writer", "agent process error", 0.0)
         return False
 
-    if not output_path.exists() or output_path.stat().st_size < 200:
+    if not output_path.exists() or output_path.stat().st_size < MIN_OUTPUT_BYTES:
         logger.error(f"[phase2] Output file missing or too small: {output_path}")
         print("[PHASE:2] FAILED — agent did not write output file")
+        if ledger:
+            ledger.mark_failed("phase2:requirements_writer", "output missing/too small", 0.0)
         return False
 
     requirements_md = output_path.read_text(encoding="utf-8")
@@ -669,6 +832,9 @@ def run_phase2(results: list, artifacts_dir: Path, project_dir: Path,
     if not (has_title and has_fr):
         logger.warning("[phase2] Output may be incomplete (missing title or FR entries)")
         print("[PHASE:2] WARNING — output may be incomplete, check _requirements.md")
+
+    if ledger:
+        ledger.mark_done("phase2:requirements_writer", output_path, 0.0)
 
     fr_count = requirements_md.count("| FR-")
     nfr_count = requirements_md.count("| NFR-")
@@ -719,6 +885,7 @@ def run_phase_requirements_critic(
     output_dir: Path,
     results: list,
     max_rounds: int = MAX_CRITIC_ROUNDS,
+    ledger=None,
 ) -> bool:
     """Run requirements_critic → requirements_writer revision loop.
 
@@ -726,37 +893,58 @@ def run_phase_requirements_critic(
     is reached. Always returns True — a safety-cap stop is a quality warning,
     not a fatal pipeline failure.
     """
+    if ledger and ledger.is_critic_complete():
+        print("[PHASE:3] Skipping — critic loop already complete")
+        return True
+
     prompts_dir = artifacts_dir / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
-    for round_num in range(1, max_rounds + 1):
+
+    start_round = (ledger.get_critic_round() if ledger else 0) + 1
+
+    for round_num in range(start_round, max_rounds + 1):
         verdict_path = artifacts_dir / "extracts" / f"_requirements_critic_r{round_num}" / "verdict.md"
         verdict_path.parent.mkdir(parents=True, exist_ok=True)
 
-        critic_prompt = PHASE_CRITIC_PROMPT_TEMPLATE.format(
-            requirements_path=requirements_path,
-            extracts_dir=extracts_dir,
-            verdict_path=verdict_path,
-        )
-        critic_prompt_file = prompts_dir / f"_requirements_critic_r{round_num}.md"
-        critic_prompt_file.write_text(critic_prompt, encoding="utf-8")
+        # Skip critic if already done
+        if ledger and ledger.is_done(f"critic:r{round_num}", verdict_path, gate_verdict_file):
+            print(f"[PHASE:3] Round {round_num} critic — skipping (already done)")
+            verdict_text = verdict_path.read_text(encoding="utf-8").strip()
+        else:
+            critic_prompt = PHASE_CRITIC_PROMPT_TEMPLATE.format(
+                requirements_path=requirements_path,
+                extracts_dir=extracts_dir,
+                verdict_path=verdict_path,
+            )
+            critic_prompt_file = prompts_dir / f"_requirements_critic_r{round_num}.md"
+            critic_prompt_file.write_text(critic_prompt, encoding="utf-8")
 
-        print(f"[PHASE:3] Round {round_num}/{max_rounds} — running requirements_critic ...")
-        ok, jsonl_log = run_agent_write_mode(
-            "requirements_critic", critic_prompt_file,
-            f"_requirements_critic_r{round_num}",
-            output_path=verdict_path, model=None, project_dir=project_dir,
-        )
-        if jsonl_log:
-            (verdict_path.parent / "agent.jsonl").write_text(jsonl_log)
+            print(f"[PHASE:3] Round {round_num}/{max_rounds} — running requirements_critic ...")
+            if ledger:
+                ledger.mark_running(f"critic:r{round_num}")
+            ok, jsonl_log = run_agent_write_mode(
+                "requirements_critic", critic_prompt_file,
+                f"_requirements_critic_r{round_num}",
+                output_path=verdict_path, model=None, project_dir=project_dir,
+            )
+            if jsonl_log:
+                (verdict_path.parent / "agent.jsonl").write_text(jsonl_log)
 
-        if not ok or not verdict_path.exists():
-            logger.warning(f"[phase3] Critic did not produce verdict file (round {round_num})")
-            print(f"[PHASE:3] WARNING — critic failed to write verdict (round {round_num}), skipping")
-            return True  # non-fatal
+            if not ok or not verdict_path.exists():
+                logger.warning(f"[phase3] Critic did not produce verdict file (round {round_num})")
+                print(f"[PHASE:3] WARNING — critic failed to write verdict (round {round_num}), skipping")
+                if ledger:
+                    ledger.mark_failed(f"critic:r{round_num}", "no verdict file", 0.0)
+                return True  # non-fatal
 
-        verdict_text = verdict_path.read_text(encoding="utf-8").strip()
+            if ledger:
+                ledger.mark_done(f"critic:r{round_num}", verdict_path, 0.0)
+            verdict_text = verdict_path.read_text(encoding="utf-8").strip()
+
         if verdict_text.startswith("VERDICT: APPROVED"):
             print(f"[PHASE:3] APPROVED on round {round_num}")
+            if ledger:
+                ledger.set_critic_complete("APPROVED")
             return True
 
         print(f"[PHASE:3] REVISE requested (round {round_num})")
@@ -765,9 +953,19 @@ def run_phase_requirements_critic(
         if round_num == max_rounds:
             print(f"[PHASE:3] Safety cap ({max_rounds} rounds) reached without APPROVED — stopping with warnings")
             logger.warning(f"[phase3] Critic safety cap hit ({max_rounds} rounds); document may still have unresolved findings")
+            if ledger:
+                ledger.set_critic_complete("REVISE_CAP")
             return True
 
         # Revision: feed verdict back to requirements_writer
+        revision_step = f"revision:r{round_num}"
+        rev_done = ledger.is_done(revision_step, requirements_path, gate_requirements_file) if ledger else False
+        if rev_done:
+            print(f"[PHASE:3] Round {round_num} revision — skipping (already done)")
+            if ledger:
+                ledger.update_critic_loop(round_num, "REVISE")
+            continue
+
         successful = [r for r in results if r.success]
         extract_paths = [
             extracts_dir / r.slug / "extract.json"
@@ -788,6 +986,8 @@ def run_phase_requirements_critic(
         revision_prompt_file.write_text(writer_revision_prompt, encoding="utf-8")
 
         print(f"[PHASE:3] Running requirements_writer revision {round_num + 1} ...")
+        if ledger:
+            ledger.mark_running(revision_step)
         w_ok, w_log = run_agent_write_mode(
             "requirements_writer", revision_prompt_file,
             f"_requirements_writer_r{round_num + 1}",
@@ -801,7 +1001,13 @@ def run_phase_requirements_critic(
         if not w_ok:
             logger.warning(f"[phase3] Revision writer failed on round {round_num + 1}")
             print(f"[PHASE:3] WARNING — writer revision failed (round {round_num + 1})")
+            if ledger:
+                ledger.mark_failed(revision_step, "writer process error", 0.0)
             return True  # non-fatal
+
+        if ledger:
+            ledger.mark_done(revision_step, requirements_path, 0.0)
+            ledger.update_critic_loop(round_num, "REVISE")
 
     return True
 
@@ -850,13 +1056,25 @@ def hitl_clarify(flagged: list, interactive: bool) -> dict:
 
 # ── Phase 1: Main flow ────────────────────────────────────────────────────────
 def run_phase1(entries: list, project_dir: Path, artifacts_dir: Path,
-               params: dict, interactive: bool) -> list:
+               params: dict, interactive: bool, ledger=None) -> list:
     prompts_dir = artifacts_dir / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
 
+    already_done: list = []
     tasks = []
     for entry in entries:
         slug = entry["slug"]
+        artifact_path = artifacts_dir / "extracts" / slug / "extract.json"
+        if ledger and ledger.is_done(f"extract:{slug}", artifact_path, gate_extract_file):
+            print(f"[PHASE:1] [{slug}] skipping — already done")
+            try:
+                parsed_json = json.loads(artifact_path.read_text())
+            except Exception:
+                parsed_json = {}
+            already_done.append(AgentResult(
+                slug=slug, success=True, raw_text="", parsed_json=parsed_json,
+            ))
+            continue
         prompt_content = render_prompt(entry)
         prompt_file = prompts_dir / f"{slug}.md"
         prompt_file.write_text(prompt_content, encoding="utf-8")
@@ -867,11 +1085,26 @@ def run_phase1(entries: list, project_dir: Path, artifacts_dir: Path,
             "model": None,
         })
 
-    print(f"[PHASE:1] Running {len(tasks)} agents in parallel")
-    results = run_agents_parallel(tasks, project_dir)
+    if tasks:
+        suffix = f" ({len(already_done)} already done)" if already_done else ""
+        print(f"[PHASE:1] Running {len(tasks)} agents in parallel{suffix}")
+        if ledger:
+            for t in tasks:
+                ledger.mark_running(f"extract:{t['slug']}")
+        new_results = run_agents_parallel(tasks, project_dir)
+        for r in new_results:
+            save_extract(r, artifacts_dir)
+            if ledger:
+                artifact = artifacts_dir / "extracts" / r.slug / "extract.json"
+                if r.success:
+                    ledger.mark_done(f"extract:{r.slug}", artifact, 0.0)
+                else:
+                    ledger.mark_failed(f"extract:{r.slug}", r.error, 0.0)
+    else:
+        print(f"[PHASE:1] All {len(already_done)} extract(s) already done — skipping")
+        new_results = []
 
-    for r in results:
-        save_extract(r, artifacts_dir)
+    results = already_done + new_results
 
     # HITL:clarify — up to 2 rounds
     for round_num in range(1, 3):
@@ -898,7 +1131,7 @@ def run_phase1(entries: list, project_dir: Path, artifacts_dir: Path,
                 "agent": "source_processor",
                 "slug": slug,
                 "prompt_file": prompt_file,
-                "model": model,
+                "model": None,
             })
 
         if retry_tasks:
@@ -1127,6 +1360,77 @@ def run_discovery(project_dir: Path, interactive: bool) -> int:
         return 1
 
 
+# ── Resume command ────────────────────────────────────────────────────────────
+def cmd_resume(output_dir: Path) -> int:
+    """Resume an interrupted extraction run using its state.json."""
+    state_path = output_dir / "state.json"
+    if not state_path.exists():
+        print(f"[ERROR] No state.json found in {output_dir}", file=sys.stderr)
+        return 1
+
+    ledger = Ledger.load(state_path)
+    project_dir = ledger.project_dir
+    run_id = ledger.run_id
+
+    if not project_dir.exists() or not project_dir.is_dir():
+        print(f"[ERROR] Project dir not found: {project_dir}", file=sys.stderr)
+        return 1
+
+    artifacts_dir = output_dir / f"_artifacts_{run_id}"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        str(artifacts_dir / "runner.log"), level="DEBUG", encoding="utf-8",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+    )
+
+    print(f"[RESUME] Resuming run {run_id} from {output_dir}")
+
+    if not check_copilot_cli():
+        print("[ERROR] 'copilot' CLI not found in PATH.", file=sys.stderr)
+        return 1
+
+    plan_dir = output_dir / "plan"
+    create_default_params(plan_dir)
+    params = load_params(plan_dir)
+
+    # Re-scan project to get entries (fast, no agents)
+    entries = scan_project(project_dir)
+    if not entries:
+        print("[ERROR] No supported files found in project directory.", file=sys.stderr)
+        return 1
+
+    # Phase 1 (skips already-done extracts via ledger)
+    results = run_phase1(entries, project_dir, artifacts_dir, params, False, ledger=ledger)
+
+    ok = sum(1 for r in results if r.success)
+    failed = sum(1 for r in results if not r.success)
+    print(f"[RESUME] Extraction: {ok} ok, {failed} failed.")
+
+    # Phase 2
+    phase2_ok = run_phase2(results, artifacts_dir, project_dir, params, output_dir, ledger=ledger)
+    if not phase2_ok:
+        print("[DONE] Phase 2 failed — check logs above.")
+        return 1
+
+    requirements_path = output_dir / "_requirements.md"
+    extracts_dir = artifacts_dir / "extracts"
+
+    # Phase 3
+    run_phase_requirements_critic(
+        requirements_path=requirements_path,
+        extracts_dir=extracts_dir,
+        artifacts_dir=artifacts_dir,
+        project_dir=project_dir,
+        params=params,
+        output_dir=output_dir,
+        results=results,
+        ledger=ledger,
+    )
+
+    print(f"[DONE] Requirements document → {requirements_path}")
+    return 0 if failed == 0 else 1
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -1154,19 +1458,32 @@ def main():
         help="Enable DEBUG-level logging for troubleshooting",
     )
 
+    resume_parser = subparsers.add_parser("resume",
+                                          help="Resume an interrupted extraction run")
+    resume_parser.add_argument("output_dir", type=Path,
+                               help="Path to interrupted run output directory")
+    resume_parser.add_argument(
+        "--debug", action="store_true", default=False,
+        help="Enable DEBUG-level logging for troubleshooting",
+    )
+
     args = parser.parse_args()
 
-    if args.command != "run":
-        parser.print_help()
-        return 1
-
-    _stderr_level = "DEBUG" if args.debug else "INFO"
+    _debug = getattr(args, "debug", False)
+    _stderr_level = "DEBUG" if _debug else "INFO"
     logger.add(
         sys.stderr, level=_stderr_level, colorize=True,
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
     )
-    if args.debug:
+    if _debug:
         logger.debug("Debug logging enabled")
+
+    if args.command == "resume":
+        return cmd_resume(args.output_dir.resolve())
+
+    if args.command != "run":
+        parser.print_help()
+        return 1
 
     interactive = args.interactive and not args.no_interactive
     project_dir = args.project_dir.resolve()
@@ -1178,9 +1495,9 @@ def main():
     if args.mode == "discovery":
         return run_discovery(project_dir, interactive)
 
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = project_dir.parent / f"requirements_{run_ts}"
-    artifacts_dir = output_dir / f"_artifacts_{run_ts}"
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = project_dir.parent / f"requirements_{run_id}"
+    artifacts_dir = output_dir / f"_artifacts_{run_id}"
     plan_dir = output_dir / "plan"
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -1188,6 +1505,7 @@ def main():
         str(artifacts_dir / "runner.log"), level="DEBUG", encoding="utf-8",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
     )
+    ledger = Ledger.create(output_dir / "state.json", run_id, project_dir, output_dir)
 
     # Pre-flight checks
     if not check_copilot_cli():
@@ -1225,7 +1543,7 @@ def main():
 
     # ── Phase 1 ──────────────────────────────────────────────────────────────
     print("[PHASE:1] Starting source extraction ...")
-    results = run_phase1(entries, project_dir, artifacts_dir, params, interactive)
+    results = run_phase1(entries, project_dir, artifacts_dir, params, interactive, ledger=ledger)
 
     manifest = update_manifest_with_extracts(manifest, results, artifacts_dir)
     intake_dir.mkdir(parents=True, exist_ok=True)
@@ -1237,7 +1555,7 @@ def main():
     print(f"[DONE] Extracts → {artifacts_dir / 'extracts'}")
 
     # ── Phase 2 ──────────────────────────────────────────────────────────────
-    phase2_ok = run_phase2(results, artifacts_dir, project_dir, params, output_dir)
+    phase2_ok = run_phase2(results, artifacts_dir, project_dir, params, output_dir, ledger=ledger)
     if not phase2_ok:
         print("[DONE] Phase 2 failed — check logs above.")
         return 1
@@ -1254,6 +1572,7 @@ def main():
         params=params,
         output_dir=output_dir,
         results=results,
+        ledger=ledger,
     )
 
     print(f"[DONE] Requirements document → {requirements_path}")

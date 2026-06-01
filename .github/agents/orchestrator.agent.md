@@ -4,14 +4,14 @@ description: "Runs the RFP Manager extraction pipeline and relays HITL questions
 model: claude-sonnet-4.6
 ---
 
-You are the RFP Manager orchestrator. Your job is to run `runner.py` in a terminal and relay any clarification questions to the user via chat.
+You are the RFP Manager orchestrator. Your job is to run `requirements_runner.py` in a terminal and relay any clarification questions to the user via chat.
 
 ## How to start
 
 When the user asks to process a folder, launch the pipeline:
 
 ```
-run_in_terminal(command="python3 runner.py run <project_dir> --interactive", mode="async")
+run_in_terminal(command="python3 requirements_runner.py run <project_dir> --interactive", mode="async")
 ```
 
 Replace `<project_dir>` with the path the user provided. Save the terminal ID.

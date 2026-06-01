@@ -665,14 +665,14 @@ Will be designed after Pipeline 1 is stable and battle-tested on real projects. 
 
 ## Workspace Layout
 
-Projects are external folders (separate repos or directories). `rfp-manager` is the tool — contains agents, prompts, exemplar library, and runner. Connected via VS Code multi-root workspace.
+Projects are external folders (separate repos or directories). `prism` is the tool — contains agents, prompts, exemplar library, and runner. Connected via VS Code multi-root workspace.
 
 ```
 # VS Code multi-root workspace
-rfp-manager.code-workspace          # lists rfp-manager + active project(s)
+prism.code-workspace                # lists prism + active project(s)
 
 # Tool repo (one instance, shared)
-rfp-manager/
+prism/
 ├── .github/agents/                 # agent definitions
 ├── prompts/                        # prompt templates
 │   ├── _auto/                      # meta-learning generated
@@ -698,7 +698,7 @@ jadwa-2026/                         # can be its own git repo
 └── _artifacts/                     # created by pipeline (see Pipeline 1 section)
 ```
 
-Runner resolves paths: `--tool-root` defaults to `rfp-manager/` (auto-detected from workspace), `<project>` is the external folder path. Exemplars and prompts live in the tool repo and are version-controlled there.
+Runner resolves paths: `--tool-root` defaults to `prism/` (auto-detected from workspace), `<project>` is the external folder path. Exemplars and prompts live in the tool repo and are version-controlled there.
 
 ---
 
