@@ -8,8 +8,8 @@ Three pipelines, same input folder:
 
 | Pipeline | Runner | Input | Output | When to use |
 |---|---|---|---|---|
-| **Extract** | `runner.py` | Raw documents in `input/` | `_requirements.md` | Structured FR/NFR/BR spec from unstructured sources |
-| **Discovery** | `runner.py --mode discovery` | Raw documents in `input/` | `discovery_report.md` | Curated architect questions before a workshop |
+| **Extract** | `requirements_runner.py` | Raw documents in `input/` | `_requirements.md` | Structured FR/NFR/BR spec from unstructured sources |
+| **Discovery** | `requirements_runner.py --mode discovery` | Raw documents in `input/` | `discovery_report.md` | Curated architect questions before a workshop |
 | **Solution Design** | `solution_design_runner.py` | `_requirements.md` | `_solution_design.md` | Full technical solution proposal from a spec |
 
 ---
@@ -43,17 +43,33 @@ python3 -m venv .venv && .venv/bin/pip install loguru pyyaml
 cp .env.example .env   # add OPENAI_API_KEY (for Illustrator agent)
 
 # Run requirements extraction (default mode)
-python3 runner.py run /path/to/project/input
+.venv/bin/python3 requirements_runner.py run /path/to/project/input
 
 # Run discovery
-python3 runner.py run /path/to/project/input --mode discovery
+.venv/bin/python3 requirements_runner.py run /path/to/project/input --mode discovery
+
+# Check requirements run status
+.venv/bin/python3 requirements_runner.py status \
+  /path/to/project/requirements_YYYYMMDD_HHMMSS
+
+# Resume interrupted requirements run
+.venv/bin/python3 requirements_runner.py resume \
+  /path/to/project/requirements_YYYYMMDD_HHMMSS
+
+# Resume and retry all failed steps
+.venv/bin/python3 requirements_runner.py resume \
+  /path/to/project/requirements_YYYYMMDD_HHMMSS --retry-failed
+
+# Force-rerun a specific step
+.venv/bin/python3 requirements_runner.py resume \
+  /path/to/project/requirements_YYYYMMDD_HHMMSS --force-step critic:r2
 
 # Run solution design (after extraction)
 .venv/bin/python3 solution_design_runner.py run \
   /path/to/project/requirements_YYYYMMDD_HHMMSS/_requirements.md \
   --models claude-sonnet-4.6 gpt-5.5
 
-# Check run status
+# Check solution design run status
 .venv/bin/python3 solution_design_runner.py status \
   /path/to/project/solution_design_YYYYMMDD_HHMMSS
 
@@ -70,20 +86,26 @@ python3 runner.py run /path/to/project/input --mode discovery
   /path/to/project/solution_design_YYYYMMDD_HHMMSS --force-step selector
 
 # Interactive (HITL pauses at checkpoints)
-python3 runner.py run /path/to/project/input --interactive
+.venv/bin/python3 requirements_runner.py run /path/to/project/input --interactive
 
 # Verbose logging
-python3 runner.py run /path/to/project/input --debug
+.venv/bin/python3 requirements_runner.py run /path/to/project/input --debug
 ```
 
-### `runner.py` flags
+### `requirements_runner.py` flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `--mode` | `extract` | `extract` or `discovery` |
-| `--interactive` | off | Pause at HITL checkpoints for clarification |
-| `--no-interactive` | — | Explicitly skip all HITL pauses (headless) |
-| `--debug` | off | Enable DEBUG-level logging to stderr |
+| Subcommand | Argument | Default | Description |
+|---|---|---|---|
+| `run` | `input_dir` | — | Path to the `input/` folder |
+| `run` | `--mode` | `extract` | `extract` or `discovery` |
+| `run` | `--interactive` | off | Pause at HITL checkpoints for clarification |
+| `run` | `--no-interactive` | — | Explicitly skip all HITL pauses (headless) |
+| `run` | `--debug` | off | Enable DEBUG-level logging to stderr |
+| `status` | `output_dir` | — | Print step table: status, elapsed, tries, artifact/error per step |
+| `resume` | `output_dir` | — | Path to the output dir (must contain `state.json`) |
+| `resume` | `--retry-failed` | off | Reset all `failed` steps to `pending` before resuming |
+| `resume` | `--force-step STEP_ID` | — | Force-reset one step by ID (e.g. `writer`, `critic:r2`) |
+| `resume` | `--debug` | off | Enable DEBUG-level logging to stderr |
 
 ### `solution_design_runner.py` flags
 
@@ -159,7 +181,7 @@ Phase 0 → Phase 1 (parallel) → Phase 2 → Phase 3 (loop)
 
 #### Phase 0 — Scan + Manifest
 
-`runner.py` walks `input/`, classifies every item, builds `manifest.json`:
+`requirements_runner.py` walks `input/`, classifies every item, builds `manifest.json`:
 
 | Entry kind | What it is | Read tool |
 |---|---|---|
@@ -238,6 +260,17 @@ Reads `probe_output.json` and:
 - rejects generic or answerable questions
 - curates **8–15 questions** that block architecture decisions if unanswered
 - writes `discovery_report.md` directly to the output folder
+
+---
+
+#### Crash Recovery — `requirements_runner.py`
+
+`state.json` is written atomically after every step (`tmp → os.replace`). Any step with status `running` at startup is automatically reset to `pending`. Use the `resume` subcommand to continue — already-completed steps are always skipped.
+
+- `resume` alone — continue from where execution stopped; pending/running steps proceed, done steps are skipped
+- `resume --retry-failed` — additionally reset all `failed` steps to `pending` so they are retried
+- `resume --force-step <STEP_ID>` — force-reset one specific step to `pending` regardless of its current status
+- `status` — read-only view of the run: step table with icons (`✓` done, `✗` failed, `⟳` running, `○` pending), elapsed time, attempt count, and artifact path or error message
 
 ---
 
@@ -369,7 +402,7 @@ project/
 
 ---
 
-<!-- ILLUSTRATION: type=architecture, section=Architecture, description="Pure white background (#FFFFFF). Central architecture diagram showing the relationship between Python runners and Copilot CLI agents. TOP row: two Python runner boxes — 'runner.py (Extract / Discovery)' in green and 'solution_design_runner.py (Solution Design)' in purple — side by side. Each runner has a label 'Brain: phase ordering, parallelism, crash recovery, retry logic'. MIDDLE: thick arrows pointing DOWN from each runner to their respective agent groups. LEFT group under runner.py (green border): source_processor, arch_probe, arch_critic, requirements_writer, requirements_critic — each as a rounded box labeled with agent name and role. RIGHT group under solution_design_runner.py (purple border): solution_designer ×N, solution_design_selector, solution_design_critic — each as a rounded box. BOTTOM: a horizontal row of file/document icons representing disk artifacts: extract.json, _requirements.md, probe_output.json, discovery_report.md, _design_*.md, _solution_design.md, _verdict_*.md — labeled as 'Files on disk = protocol between phases'. Thin arrows connect agents to their input/output files. STANDALONE agents in a separate box on the far right: Illustrator, Confluence Publisher, word_form_builder — labeled 'Optional standalone'. Fill the entire canvas. No empty margins or padding around the diagram." -->
+<!-- ILLUSTRATION: type=architecture, section=Architecture, description="Pure white background (#FFFFFF). Central architecture diagram showing the relationship between Python runners and Copilot CLI agents. TOP row: two Python runner boxes — 'requirements_runner.py (Extract / Discovery)' in green and 'solution_design_runner.py (Solution Design)' in purple — side by side. Each runner has a label 'Brain: phase ordering, parallelism, crash recovery, retry logic'. MIDDLE: thick arrows pointing DOWN from each runner to their respective agent groups. LEFT group under requirements_runner.py (green border): source_processor, arch_probe, arch_critic, requirements_writer, requirements_critic — each as a rounded box labeled with agent name and role. RIGHT group under solution_design_runner.py (purple border): solution_designer ×N, solution_design_selector, solution_design_critic — each as a rounded box. BOTTOM: a horizontal row of file/document icons representing disk artifacts: extract.json, _requirements.md, probe_output.json, discovery_report.md, _design_*.md, _solution_design.md, _verdict_*.md — labeled as 'Files on disk = protocol between phases'. Thin arrows connect agents to their input/output files. STANDALONE agents in a separate box on the far right: Illustrator, Confluence Publisher, word_form_builder — labeled 'Optional standalone'. Fill the entire canvas. No empty margins or padding around the diagram." -->
 
 ![Fig. 2 — Python runners, agent groups, and disk artifacts](docs/illustrations/agents.png)
 
@@ -377,11 +410,11 @@ project/
 
 ### Three principles
 
-**Python = brain.** All phase ordering, branching, retry limits, and parallelism live in `runner.py`. Agents have zero orchestration logic.
+**Python = brain.** All phase ordering, branching, retry limits, and parallelism live in `requirements_runner.py` and `solution_design_runner.py`. Agents have zero orchestration logic.
 
 **Agents = stateless workers.** Each agent is a `.agent.md` file in `.github/agents/`. Invoked as a `copilot` CLI subprocess — reads a task prompt from disk, writes output to disk, exits.
 
-**Files = protocol.** Every inter-phase handoff is a file on disk. `runner.py` validates each file before proceeding to the next phase.
+**Files = protocol.** Every inter-phase handoff is a file on disk. Both runners validate each file before proceeding to the next phase.
 
 ### Agent invocation
 
@@ -416,7 +449,7 @@ All 12 agents live in `.github/agents/`. Each is a `.agent.md` file with a YAML 
 | `solution_designer` | Solution Design | Produces a publication-quality solution design: single committed architecture, stakeholder map, phased delivery, NFRs, infrastructure reference | `_requirements.md` | `_design_<model>.md` |
 | `solution_design_selector` | Solution Design | Compares N candidate designs, selects the strongest one, writes `WINNING_MODEL:` to the report | N `_design_*.md` files | `_solution_design.md` + `_selection_report.md` |
 | `solution_design_critic` | Solution Design | Reviews the design against requirements; writes APPROVED or REVISE with `## Issues` block | `_solution_design.md` | `_verdict_roundN.md` |
-| `orchestrator` | Interactive wrapper | VS Code chat agent; starts `runner.py` in terminal, surfaces HITL checkpoints, routes user answers back | User chat input | Terminal commands + `vscode_askQuestions` prompts |
+| `orchestrator` | Interactive wrapper | VS Code chat agent; starts `requirements_runner.py` in terminal, surfaces HITL checkpoints, routes user answers back | User chat input | Terminal commands + `vscode_askQuestions` prompts |
 | `Illustrator` | Standalone | Generates publication-quality PNG illustrations using PaperBanana (Retriever → Planner → Stylist → Visualizer ↔ Critic sub-pipeline) | `<!-- ILLUSTRATION: -->` placeholders in any Markdown doc | PNG files + embedded captions |
 | `Confluence Publisher` | Standalone | Publishes a finalized Markdown document to Confluence — converts to XHTML, creates/updates page, uploads PNG attachments via REST API | `_requirements.md` or `_solution_design.md` + illustrations | Confluence page with embedded images |
 | `word_form_builder` | Standalone | Generates an interactive Word `.docx` clarification form — native SDT checkboxes, dropdowns, pre-filled tables; options enriched via Tavily | `_requirements.md` + extracts | `clarification_form_rN.docx` |
@@ -488,8 +521,8 @@ The orchestrator starts the pipeline and surfaces decision points:
 Headless (default):
 
 ```bash
-python3 runner.py run /path/to/input           # --no-interactive is default
-python3 runner.py run /path/to/input --debug   # verbose logs to stderr
+.venv/bin/python3 requirements_runner.py run /path/to/input           # --no-interactive is default
+.venv/bin/python3 requirements_runner.py run /path/to/input --debug   # verbose logs to stderr
 ```
 
 ---
@@ -538,9 +571,8 @@ OPENAI_API_KEY=sk-...
 
 ```
 prism/
-  runner.py                          ← Extract / Discovery pipeline orchestrator
+  requirements_runner.py             ← Extract / Discovery pipeline orchestrator
   solution_design_runner.py          ← Solution Design pipeline orchestrator
-  requirements_runner.py             ← alias / entry-point (same as runner.py)
   .env                               ← secrets (gitignored)
   .venv/                             ← Python virtual environment
   .github/
@@ -590,7 +622,7 @@ prism/
 ## Dependencies
 
 ```bash
-pip install loguru pyyaml                          # runner.py + solution_design_runner.py
+pip install loguru pyyaml                          # requirements_runner.py + solution_design_runner.py
 pip install "paperbanana[openai]" python-dotenv   # Illustrator agent only
 ```
 
