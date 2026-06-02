@@ -84,6 +84,7 @@ class Ledger:
         return datetime.now(_tz.utc).isoformat()
 
     def _save(self):
+        self._state["updated_at"] = self._now()
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._state, ensure_ascii=False, indent=2))
         os.replace(tmp, self._path)
@@ -158,10 +159,10 @@ class Ledger:
 
     def mark_running(self, step_id: str) -> None:
         with self._lock:
-            self._state.setdefault("steps", {})[step_id] = {
-                "state": "running",
-                "started_at": self._now(),
-            }
+            step = self._state.setdefault("steps", {}).setdefault(step_id, {})
+            step["state"] = "running"
+            step["started_at"] = self._now()
+            step["attempts"] = step.get("attempts", 0) + 1
             self._save()
 
     def mark_done(self, step_id: str, artifact_path: Path, wall_s: float) -> None:
@@ -176,13 +177,48 @@ class Ledger:
 
     def mark_failed(self, step_id: str, error: str, wall_s: float) -> None:
         with self._lock:
-            self._state.setdefault("steps", {})[step_id] = {
+            step = self._state.setdefault("steps", {}).setdefault(step_id, {})
+            step.update({
                 "state": "failed",
                 "error": error,
                 "wall_s": round(wall_s, 1),
                 "failed_at": self._now(),
-            }
+            })
             self._save()
+
+    def reset_failed_steps(self) -> int:
+        """Mark all failed steps as pending so they retry on resume. Returns count reset."""
+        with self._lock:
+            count = 0
+            has_failed_critic = False
+            for sid, step in self._state.get("steps", {}).items():
+                if step.get("state") == "failed":
+                    step["state"] = "pending"
+                    count += 1
+                    if sid.startswith(("critic:", "revision:")):
+                        has_failed_critic = True
+            if has_failed_critic and self._state.get("critic_complete"):
+                self._state["critic_complete"] = False
+            if count:
+                self._save()
+            return count
+
+    def reset_step(self, step_id: str) -> bool:
+        """Force-reset a single step to pending. Returns True if the step was found."""
+        with self._lock:
+            step = self._state.get("steps", {}).get(step_id)
+            if step is None:
+                return False
+            step["state"] = "pending"
+            if step_id.startswith(("critic:", "revision:")):
+                self._state["critic_complete"] = False
+            self._save()
+            return True
+
+    @property
+    def raw_state(self) -> dict:
+        """Read-only snapshot of full state for display."""
+        return dict(self._state)
 
 
 DEFAULT_PARAMS_YAML = """\
@@ -1360,8 +1396,58 @@ def run_discovery(project_dir: Path, interactive: bool) -> int:
         return 1
 
 
+# ── Status display ────────────────────────────────────────────────────────────
+
+_STATUS_ICON = {"done": "✓", "failed": "✗", "running": "⟳", "pending": "○"}
+
+
+def _print_run_state(ledger: "Ledger", out_dir: Path) -> None:
+    """Print a human-readable summary of run state to stdout."""
+    st = ledger.raw_state
+    print(f"\n{'─' * 70}", flush=True)
+    print(f"  Run:      {st['run_id']}", flush=True)
+    print(f"  Created:  {st['created_at']}", flush=True)
+    print(f"  Updated:  {st['updated_at']}", flush=True)
+    print(f"  Project:  {st.get('project_dir', 'N/A')}", flush=True)
+    print(
+        f"  Critic:   round {st.get('critic_round', 0)}"
+        f"  verdict={st.get('last_verdict') or 'N/A'}"
+        f"  complete={st.get('critic_complete', False)}",
+        flush=True,
+    )
+    print(flush=True)
+
+    steps = st.get("steps", {})
+    if not steps:
+        print("  (no steps recorded yet)", flush=True)
+    else:
+        hdr = f"  {'Step':<35} {'Status':<10} {'Elapsed':>8}  {'Tries':>5}  Info"
+        print(hdr, flush=True)
+        print(f"  {'─' * 66}", flush=True)
+        for sid, s in steps.items():
+            icon = _STATUS_ICON.get(s.get("state", ""), "?")
+            wall = f"{s['wall_s']:.0f}s" if s.get("wall_s") else "  -"
+            tries = s.get("attempts", 1)
+            info = s.get("error") or (Path(s["artifact"]).name if s.get("artifact") else "")
+            print(
+                f"  {icon} {sid:<34} {s.get('state', '?'):<10} {wall:>8}  {tries:>5}  {info}",
+                flush=True,
+            )
+    print(f"{'─' * 70}\n", flush=True)
+
+
+def cmd_status(output_dir: Path) -> int:
+    state_path = output_dir / "state.json"
+    if not state_path.exists():
+        print(f"[ERROR] No state.json found in {output_dir}", file=sys.stderr)
+        return 1
+    ledger = Ledger.load(state_path)
+    _print_run_state(ledger, output_dir)
+    return 0
+
+
 # ── Resume command ────────────────────────────────────────────────────────────
-def cmd_resume(output_dir: Path) -> int:
+def cmd_resume(output_dir: Path, retry_failed: bool = False, force_step: str | None = None) -> int:
     """Resume an interrupted extraction run using its state.json."""
     state_path = output_dir / "state.json"
     if not state_path.exists():
@@ -1369,8 +1455,24 @@ def cmd_resume(output_dir: Path) -> int:
         return 1
 
     ledger = Ledger.load(state_path)
+
+    if retry_failed:
+        n = ledger.reset_failed_steps()
+        if n:
+            print(f"[RESUME] Reset {n} failed step(s) to pending", flush=True)
+        else:
+            print("[RESUME] No failed steps to reset", flush=True)
+
+    if force_step:
+        if ledger.reset_step(force_step):
+            print(f"[RESUME] Force-reset step '{force_step}' to pending", flush=True)
+        else:
+            print(f"[WARNING] Step '{force_step}' not found in ledger", flush=True)
+
     project_dir = ledger.project_dir
     run_id = ledger.run_id
+
+    _print_run_state(ledger, output_dir)
 
     if not project_dir.exists() or not project_dir.is_dir():
         print(f"[ERROR] Project dir not found: {project_dir}", file=sys.stderr)
@@ -1466,6 +1568,18 @@ def main():
         "--debug", action="store_true", default=False,
         help="Enable DEBUG-level logging for troubleshooting",
     )
+    resume_parser.add_argument(
+        "--retry-failed", action="store_true",
+        help="Reset all failed steps to pending so they are retried",
+    )
+    resume_parser.add_argument(
+        "--force-step", metavar="STEP_ID",
+        help="Force-reset a specific step to pending even if it completed successfully",
+    )
+
+    status_parser = subparsers.add_parser("status", help="Show the current state of a run")
+    status_parser.add_argument("output_dir", type=Path,
+                               help="Path to run output directory (contains state.json)")
 
     args = parser.parse_args()
 
@@ -1479,7 +1593,14 @@ def main():
         logger.debug("Debug logging enabled")
 
     if args.command == "resume":
-        return cmd_resume(args.output_dir.resolve())
+        return cmd_resume(
+            args.output_dir.resolve(),
+            retry_failed=args.retry_failed,
+            force_step=args.force_step,
+        )
+
+    if args.command == "status":
+        return cmd_status(args.output_dir.resolve())
 
     if args.command != "run":
         parser.print_help()
