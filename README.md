@@ -53,9 +53,21 @@ python3 runner.py run /path/to/project/input --mode discovery
   /path/to/project/requirements_YYYYMMDD_HHMMSS/_requirements.md \
   --models claude-sonnet-4.6 gpt-5.5
 
+# Check run status
+.venv/bin/python3 solution_design_runner.py status \
+  /path/to/project/solution_design_YYYYMMDD_HHMMSS
+
 # Resume interrupted solution design
 .venv/bin/python3 solution_design_runner.py resume \
   /path/to/project/solution_design_YYYYMMDD_HHMMSS
+
+# Resume and retry all failed steps
+.venv/bin/python3 solution_design_runner.py resume \
+  /path/to/project/solution_design_YYYYMMDD_HHMMSS --retry-failed
+
+# Force-rerun a specific step
+.venv/bin/python3 solution_design_runner.py resume \
+  /path/to/project/solution_design_YYYYMMDD_HHMMSS --force-step selector
 
 # Interactive (HITL pauses at checkpoints)
 python3 runner.py run /path/to/project/input --interactive
@@ -80,7 +92,10 @@ python3 runner.py run /path/to/project/input --debug
 | `run` | `requirements_path` | — | Path to `_requirements.md` |
 | `run` | `--models MODEL [...]` | `claude-sonnet-4.6 gpt-5.5` | Models for parallel Phase 1 |
 | `run` | `--verbose` / `-v` | off | DEBUG logging to stderr |
+| `status` | `output_dir` | — | Show step table for an existing run |
 | `resume` | `output_dir` | — | Output dir containing `state.json` |
+| `resume` | `--retry-failed` | off | Reset all failed steps to pending before resuming |
+| `resume` | `--force-step STEP_ID` | — | Force-reset one specific step (e.g. `selector`, `critic:r2`) |
 | `resume` | `--verbose` / `-v` | off | DEBUG logging to stderr |
 
 ---
@@ -283,9 +298,21 @@ Prints paths to all output artifacts, the winning model, final critic verdict, a
   /path/to/project/requirements_YYYYMMDD_HHMMSS/_requirements.md \
   --models claude-sonnet-4.6 gpt-5.5
 
-# Resume after crash
+# Check what happened (step table with status, elapsed, tries)
+.venv/bin/python3 solution_design_runner.py status \
+  /path/to/project/solution_design_YYYYMMDD_HHMMSS
+
+# Resume after crash (skips already-done steps)
 .venv/bin/python3 solution_design_runner.py resume \
   /path/to/project/solution_design_YYYYMMDD_HHMMSS
+
+# Resume and retry all failed steps
+.venv/bin/python3 solution_design_runner.py resume \
+  /path/to/project/solution_design_YYYYMMDD_HHMMSS --retry-failed
+
+# Force-rerun a specific step even if it completed
+.venv/bin/python3 solution_design_runner.py resume \
+  /path/to/project/solution_design_YYYYMMDD_HHMMSS --force-step critic:r2
 
 # Verbose logging
 .venv/bin/python3 solution_design_runner.py run <path> --verbose
@@ -298,7 +325,10 @@ Prints paths to all output artifacts, the winning model, final critic verdict, a
 | `run` | `requirements_path` | — | Path to `_requirements.md` |
 | `run` | `--models MODEL [MODEL ...]` | `claude-sonnet-4.6 gpt-5.5` | Models for parallel Phase 1 generation |
 | `run` | `--verbose` / `-v` | off | Enable DEBUG-level logging to stderr |
+| `status` | `output_dir` | — | Print step table: status, elapsed, tries, artifact/error per step |
 | `resume` | `output_dir` | — | Path to the output dir (must contain `state.json`) |
+| `resume` | `--retry-failed` | off | Reset all `failed` steps to `pending` before resuming |
+| `resume` | `--force-step STEP_ID` | — | Force-reset one step by ID (e.g. `selector`, `critic:r2`, `designer-gpt-5_5`) |
 | `resume` | `--verbose` / `-v` | off | Enable DEBUG-level logging to stderr |
 
 #### Output Structure — Solution Design
@@ -330,7 +360,12 @@ project/
 
 #### Crash Recovery
 
-`state.json` is written atomically after every step (`tmp → os.replace`). Any step with status `running` at startup is reset to `pending`. Resume with the `resume` subcommand — already-completed steps are skipped, failed steps are retried.
+`state.json` is written atomically after every step (`tmp → os.replace`). Any step with status `running` at startup is automatically reset to `pending`. Use the `resume` subcommand to continue — already-completed steps are always skipped.
+
+- `resume` alone — continue from where execution stopped; pending/running steps proceed, done steps are skipped
+- `resume --retry-failed` — additionally reset all `failed` steps to `pending` so they are retried
+- `resume --force-step <STEP_ID>` — force-reset one specific step to `pending` regardless of its current status
+- `status` — read-only view of the run: step table with icons (`✓` done, `✗` failed, `⟳` running, `○` pending), elapsed time, attempt count, and artifact path or error message
 
 ---
 

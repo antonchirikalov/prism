@@ -10,7 +10,16 @@ Phase 4: Print final output summary.
 
 Usage:
     python3 solution_design_runner.py run <path_to/_requirements.md> [--verbose]
+    python3 solution_design_runner.py status <output_dir>
     python3 solution_design_runner.py resume <output_dir>            [--verbose]
+    python3 solution_design_runner.py resume <output_dir>            [--retry-failed] [--verbose]
+    python3 solution_design_runner.py resume <output_dir>            [--force-step STEP_ID] [--verbose]
+
+Step IDs (for --force-step):
+    designer-<model>   e.g. designer-claude-sonnet-4_6
+    selector
+    critic:r1  critic:r2  critic:r3
+    revision:r1  revision:r2
 """
 
 import argparse
@@ -169,6 +178,47 @@ class Ledger:
             self._state["loops"]["critic"]["complete"] = True
             self._state["loops"]["critic"]["last_verdict"] = last_verdict
             self._save()
+
+    # ── resume helpers ────────────────────────────────────────────────────────
+
+    def reset_failed_steps(self) -> int:
+        """Mark all failed steps as pending so they retry on resume. Returns count reset."""
+        with self._lock:
+            count = 0
+            has_failed_critic = False
+            for sid, step in self._state["steps"].items():
+                if step.get("status") == "failed":
+                    step["status"] = "pending"
+                    count += 1
+                    if sid.startswith(("critic:", "revision:")):
+                        has_failed_critic = True
+            # If a critic/revision step failed the loop may be stuck; un-complete it
+            if has_failed_critic and self._state["loops"]["critic"].get("complete"):
+                self._state["loops"]["critic"]["complete"] = False
+            if count:
+                self._save()
+            return count
+
+    def reset_step(self, step_id: str) -> bool:
+        """Force-reset a single step to pending. Returns True if the step was found."""
+        with self._lock:
+            step = self._state["steps"].get(step_id)
+            if step is None:
+                return False
+            step["status"] = "pending"
+            if step_id.startswith(("critic:", "revision:")):
+                self._state["loops"]["critic"]["complete"] = False
+            self._save()
+            return True
+
+    @property
+    def critic_loop_state(self) -> dict:
+        return self._state["loops"]["critic"]
+
+    @property
+    def raw_state(self) -> dict:
+        """Read-only snapshot of full state for display."""
+        return dict(self._state)
 
     # ── step transitions ──────────────────────────────────────────────────────
 
@@ -399,6 +449,71 @@ def parse_verdict(verdict_path: Path) -> str:
     return "REVISE"
 
 
+# ── Status display ────────────────────────────────────────────────────────────
+
+_STATUS_ICON = {"done": "✓", "failed": "✗", "running": "⟳", "pending": "○"}
+
+
+def _print_run_state(ledger: Ledger, out_dir: Path) -> None:
+    """Print a human-readable summary of run state to stdout."""
+    st = ledger.raw_state
+    critic = ledger.critic_loop_state
+
+    print(f"\n{'─' * 70}", flush=True)
+    print(f"  Run:      {st['run_id']}", flush=True)
+    print(f"  Created:  {st['created_at']}", flush=True)
+    print(f"  Updated:  {st['updated_at']}", flush=True)
+    print(f"  Models:   {', '.join(st.get('designer_models', []))}", flush=True)
+    if st.get("winning_model"):
+        print(f"  Winner:   {st['winning_model']}", flush=True)
+    print(
+        f"  Critic:   round {critic.get('round', 0)}/{critic.get('max_rounds', MAX_CRITIC_ROUNDS)}"
+        f"  verdict={critic.get('last_verdict') or 'N/A'}"
+        f"  complete={critic.get('complete', False)}",
+        flush=True,
+    )
+    print(flush=True)
+
+    steps = st.get("steps", {})
+    if not steps:
+        print("  (no steps recorded yet)", flush=True)
+    else:
+        hdr = f"  {'Step':<32} {'Status':<10} {'Elapsed':>8}  {'Tries':>5}  Info"
+        print(hdr, flush=True)
+        print(f"  {'─' * 66}", flush=True)
+        for sid, s in steps.items():
+            icon = _STATUS_ICON.get(s.get("status", ""), "?")
+            wall = f"{s['wall_s']:.0f}s" if s.get("wall_s") else "  -"
+            tries = s.get("attempts", 1)
+            info = s.get("error") or (Path(s["artifact"]).name if s.get("artifact") else "")
+            print(
+                f"  {icon} {sid:<31} {s.get('status','?'):<10} {wall:>8}  {tries:>5}  {info}",
+                flush=True,
+            )
+
+    logs_dir = out_dir / "logs"
+    if logs_dir.exists():
+        stderr_logs = sorted(logs_dir.glob("*.stderr.txt"))
+        if stderr_logs:
+            print(flush=True)
+            print(f"  Stderr logs ({len(stderr_logs)}):", flush=True)
+            for f in stderr_logs:
+                size = f.stat().st_size
+                print(f"    {f.name}  ({size} bytes)", flush=True)
+
+    print(f"{'─' * 70}\n", flush=True)
+
+
+def cmd_status(output_dir: Path) -> int:
+    state_path = output_dir / "state.json"
+    if not state_path.exists():
+        print(f"[ERROR] No state.json found in {output_dir}", file=sys.stderr)
+        return 1
+    ledger = Ledger.load(state_path)
+    _print_run_state(ledger, output_dir)
+    return 0
+
+
 def parse_winning_model(report_path: Path, designer_models: list[str]) -> str:
     """Parses WINNING_MODEL: <value> from selection report."""
     fallback = designer_models[0]
@@ -626,20 +741,36 @@ def cmd_run(requirements_path: Path, designer_models: list[str]) -> int:
     return _execute_pipeline(out_dir, requirements_path, ledger, designer_models)
 
 
-def cmd_resume(output_dir: Path) -> int:
+def cmd_resume(output_dir: Path, retry_failed: bool = False, force_step: str | None = None) -> int:
     state_path = output_dir / "state.json"
     if not state_path.exists():
         print(f"[ERROR] No state.json found in {output_dir}", file=sys.stderr)
         return 1
 
     ledger = Ledger.load(state_path)
+
+    if retry_failed:
+        n = ledger.reset_failed_steps()
+        if n:
+            print(f"[RESUME] Reset {n} failed step(s) to pending", flush=True)
+        else:
+            print("[RESUME] No failed steps to reset", flush=True)
+
+    if force_step:
+        if ledger.reset_step(force_step):
+            print(f"[RESUME] Force-reset step '{force_step}' to pending", flush=True)
+        else:
+            print(f"[WARNING] Step '{force_step}' not found in ledger", flush=True)
+
+    print(f"[RESUME] Resuming run: {ledger.run_id}", flush=True)
+    _print_run_state(ledger, output_dir)
+
     requirements_path = ledger.requirements_path
     if not requirements_path.exists():
         print(f"[ERROR] Requirements file not found: {requirements_path}", file=sys.stderr)
         return 1
 
     designer_models = ledger.designer_models
-    print(f"[RESUME] Resuming run: {ledger.run_id}", flush=True)
     print(f"[RESUME] Designer models: {', '.join(designer_models)}", flush=True)
     return _execute_pipeline(output_dir, requirements_path, ledger, designer_models)
 
@@ -663,6 +794,17 @@ def build_parser() -> argparse.ArgumentParser:
     resume_cmd = sub.add_parser("resume", help="Resume a previously interrupted run")
     resume_cmd.add_argument("output_dir", type=Path, help="Path to the output directory (contains state.json)")
     resume_cmd.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
+    resume_cmd.add_argument(
+        "--retry-failed", action="store_true",
+        help="Reset all failed steps to pending so they are retried",
+    )
+    resume_cmd.add_argument(
+        "--force-step", metavar="STEP_ID",
+        help="Force-reset a specific step to pending even if it completed successfully",
+    )
+
+    status_cmd = sub.add_parser("status", help="Show the current state of a run")
+    status_cmd.add_argument("output_dir", type=Path, help="Path to the output directory (contains state.json)")
 
     return parser
 
@@ -675,14 +817,20 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    log_level = "DEBUG" if args.verbose else "INFO"
+    log_level = "DEBUG" if getattr(args, "verbose", False) else "INFO"
     logger.add(sys.stderr, level=log_level, colorize=True,
                format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
 
     if args.command == "run":
         sys.exit(cmd_run(args.requirements_path.resolve(), args.models))
     elif args.command == "resume":
-        sys.exit(cmd_resume(args.output_dir.resolve()))
+        sys.exit(cmd_resume(
+            args.output_dir.resolve(),
+            retry_failed=args.retry_failed,
+            force_step=args.force_step,
+        ))
+    elif args.command == "status":
+        sys.exit(cmd_status(args.output_dir.resolve()))
 
 
 if __name__ == "__main__":
